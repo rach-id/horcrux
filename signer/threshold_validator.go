@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	cometbytes "github.com/cometbft/cometbft/libs/bytes"
+	"github.com/cometbft/cometbft/types"
 	"os"
 	"strings"
 	"sync"
@@ -633,6 +635,54 @@ func (pv *ThresholdValidator) proxyIfNecessary(
 	return true, signRes.Signature, signRes.VoteExtensionSignature, stamp, nil
 }
 
+func (pv *ThresholdValidator) proxySignDigestIfNecessary(
+	ctx context.Context,
+	chainID, uniqueID string,
+	digest cometbytes.HexBytes,
+) (bool, []byte, error) {
+	if pv.leader.IsLeader() {
+		return false, nil, nil
+	}
+
+	leader := pv.leader.GetLeader()
+
+	for i := 0; i < 500 && leader == -1; i++ {
+		time.Sleep(10 * time.Millisecond)
+		leader = pv.leader.GetLeader()
+	}
+
+	if leader == -1 {
+		totalRaftLeaderElectionTimeout.Inc()
+		return true, nil, fmt.Errorf("timed out waiting for raft leader")
+	}
+
+	if leader == pv.myCosigner.GetID() {
+		return false, nil, nil
+	}
+
+	pv.logger.Debug("I am not the leader. Proxying request to the leader",
+		"chain_id", chainID,
+		"unique_id", uniqueID,
+		"digest", digest,
+	)
+	totalNotRaftLeader.Inc()
+
+	cosignerLeader := pv.peerCosigners.GetByID(leader)
+	if cosignerLeader == nil {
+		return true, nil, fmt.Errorf("failed to find cosigner with id %d", leader)
+	}
+
+	signRes, err := cosignerLeader.(*RemoteCosigner).SignDigest(ctx, CosignerSignDigestRequest{
+		ChainID:  chainID,
+		UniqueID: uniqueID,
+		Digest:   digest,
+	})
+	if err != nil {
+		return true, nil, err
+	}
+	return true, signRes.Signature, nil
+}
+
 func (pv *ThresholdValidator) Sign(
 	ctx context.Context,
 	chainID string,
@@ -989,4 +1039,178 @@ func (pv *ThresholdValidator) Sign(
 	)
 
 	return signature, voteExtSig, stamp, nil
+}
+
+func (pv *ThresholdValidator) SignDigest(ctx context.Context, chainID, uniqueID string, digest cometbytes.HexBytes) ([]byte, error) {
+	log := pv.logger.With(
+		"chain_id", chainID,
+		"unique_id", uniqueID,
+		"digest", digest,
+	)
+
+	if err := pv.LoadSignStateIfNecessary(chainID); err != nil {
+		return nil, err
+	}
+
+	// Only the leader can execute this function. Followers can handle the requests,
+	// but they just need to proxy the request to the raft leader
+	isProxied, proxySig, err := pv.proxySignDigestIfNecessary(ctx, chainID, uniqueID, digest)
+	if isProxied {
+		return proxySig, err
+	}
+
+	totalRaftLeader.Inc()
+
+	log.Debug("I am the leader. Managing the sign process for this digest")
+
+	numPeers := len(pv.peerCosigners)
+	total := uint8(numPeers + 1)
+
+	cosignersOrderedByFastest := pv.cosignerHealth.GetFastest()
+	cosignersForThisMessage := make([]Cosigner, pv.threshold)
+	cosignersForThisMessage[0] = pv.myCosigner
+	copy(cosignersForThisMessage[1:], cosignersOrderedByFastest[:pv.threshold-1])
+
+	var dontIterateFastestCosigners bool
+
+	nonces, err := pv.nonceCache.GetNonces(cosignersForThisMessage)
+	if err != nil {
+		var fallbackRes *CosignersAndNonces
+		var fallbackErr error
+
+		fallbackRes, fallbackErr = pv.getNoncesFallback(ctx, 1)
+		if fallbackErr != nil {
+			return nil, fmt.Errorf("failed to get nonces: %w", errors.Join(err, fallbackErr))
+		}
+
+		cosignersForThisMessage = fallbackRes.Cosigners
+		nonces = fallbackRes.Nonces[0]
+		dontIterateFastestCosigners = true
+	} else {
+		drainedNonceCache.Set(0)
+	}
+
+	nextFastestCosignerIndex := pv.threshold - 1
+	var nextFastestCosignerIndexMu sync.Mutex
+	getNextFastestCosigner := func() Cosigner {
+		nextFastestCosignerIndexMu.Lock()
+		defer nextFastestCosignerIndexMu.Unlock()
+		if nextFastestCosignerIndex >= len(cosignersOrderedByFastest) {
+			return nil
+		}
+		cosigner := cosignersOrderedByFastest[nextFastestCosignerIndex]
+		nextFastestCosignerIndex++
+		return cosigner
+	}
+
+	cosignersForThisMessageInt := make([]int, len(cosignersForThisMessage))
+
+	for i, cosigner := range cosignersForThisMessage {
+		cosignersForThisMessageInt[i] = cosigner.GetID()
+	}
+
+	shareSignatures := make([][]byte, total)
+	signBytes := types.DigestSignBytes(chainID, uniqueID, digest)
+	var eg errgroup.Group
+	for _, cosigner := range cosignersForThisMessage {
+		cosigner := cosigner
+		eg.Go(func() error {
+			for cosigner != nil {
+				signCtx, cancel := context.WithTimeout(ctx, pv.grpcTimeout)
+				defer cancel()
+
+				peerStartTime := time.Now()
+
+				sigReq := CosignerSetNoncesAndSignRequest{
+					ChainID:   chainID,
+					Nonces:    nonces.For(cosigner.GetID()),
+					SignBytes: signBytes,
+					IsDigest:  true,
+				}
+
+				// set peerNonces and sign in single rpc call.
+				sigRes, err := cosigner.SetNoncesAndSign(signCtx, sigReq)
+				if err != nil {
+					log.Error(
+						"Cosigner failed to set nonces and sign",
+						"cosigner", cosigner.GetID(),
+						"err", err.Error(),
+					)
+
+					if strings.Contains(err.Error(), errUnexpectedState) {
+						pv.nonceCache.ClearNonces(cosigner)
+					}
+
+					if cosigner.GetID() == pv.myCosigner.GetID() {
+						return err
+					}
+
+					if c := status.Code(err); c == codes.DeadlineExceeded || c == codes.NotFound || c == codes.Unavailable {
+						pv.cosignerHealth.MarkUnhealthy(cosigner)
+						pv.nonceCache.ClearNonces(cosigner)
+					}
+
+					if dontIterateFastestCosigners {
+						cosigner = nil
+						continue
+					}
+
+					// this will only work if the next cosigner has the nonces we've already decided to use for this message
+					// otherwise the sign attempt will fail
+					cosigner = getNextFastestCosigner()
+					continue
+				}
+
+				if cosigner != pv.myCosigner {
+					timedCosignerSignLag.WithLabelValues(cosigner.GetAddress()).Observe(time.Since(peerStartTime).Seconds())
+				}
+				shareSignatures[cosigner.GetID()-1] = sigRes.Signature
+
+				return nil
+			}
+			return fmt.Errorf("no cosigners available to sign")
+		})
+	}
+
+	if err := eg.Wait(); err != nil {
+		return nil, fmt.Errorf("error from cosigner(s): %s", err)
+	}
+
+	// collect all valid responses into array of partial signatures
+	shareSigs := make([]PartialSignature, 0, pv.threshold)
+	for idx, shareSig := range shareSignatures {
+		if len(shareSig) == 0 {
+			continue
+		}
+
+		sig := make([]byte, len(shareSig))
+		copy(sig, shareSig)
+
+		// we are ok to use the share signatures - complete boolean
+		// prevents future concurrent access
+		shareSigs = append(shareSigs, PartialSignature{
+			ID:        idx + 1,
+			Signature: sig,
+		})
+	}
+
+	if len(shareSigs) < pv.threshold {
+		totalInsufficientCosigners.Inc()
+		return nil, errors.New("not enough cosigners")
+	}
+
+	// assemble into a final signature
+	signature, err := pv.myCosigner.CombineSignatures(chainID, shareSigs)
+	if err != nil {
+		return nil, fmt.Errorf("error combining signatures: %w", err)
+	}
+
+	// verify the combined signature
+	if !pv.myCosigner.VerifySignature(chainID, signBytes, signature) {
+		totalInvalidSignature.Inc()
+
+		return nil, errors.New("combined signature is not valid")
+	}
+
+	return signature, nil
 }

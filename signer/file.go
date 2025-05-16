@@ -2,8 +2,10 @@ package signer
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	cometbytes "github.com/cometbft/cometbft/libs/bytes"
 	"os"
 	"time"
 
@@ -259,6 +261,15 @@ func (pv *FilePV) Sign(chainID string, block Block) ([]byte, []byte, time.Time, 
 	pv.saveSigned(height, round, step, signBytes, sig)
 
 	return sig, extSig, block.Timestamp, nil
+}
+
+func (pv *FilePV) SignDigest(_ context.Context, chainID, uniqueID string, digest cometbytes.HexBytes) ([]byte, error) {
+	signBytes := types.DigestSignBytes(chainID, uniqueID, digest)
+	sig, err := pv.Key.PrivKey.Sign(signBytes)
+	if err != nil {
+		return nil, err
+	}
+	return sig, nil
 }
 
 // Save persists the FilePV to disk.

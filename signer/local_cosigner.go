@@ -304,6 +304,51 @@ func (cosigner *LocalCosigner) sign(req CosignerSignRequest) (CosignerSignRespon
 	return res, nil
 }
 
+// signDigest Sign the sign request using the cosigner's shard.
+// Return the signed bytes or an error.
+// This method is exclusively used for digest messages.
+// Implements Cosigner interface.
+func (cosigner *LocalCosigner) signDigest(req CosignerSignRequest) (CosignerSignResponse, error) {
+	res := CosignerSignResponse{}
+	if !req.IsDigest {
+		return res, fmt.Errorf("not a digest")
+	}
+
+	ccs, err := cosigner.getChainState(req.ChainID)
+	if err != nil {
+		return res, err
+	}
+
+	defer func() {
+		cosigner.noncesMu.Lock()
+		delete(cosigner.nonces, req.UUID)
+		cosigner.noncesMu.Unlock()
+	}()
+
+	nonces, err := cosigner.combinedNonces(
+		cosigner.GetID(),
+		uint8(cosigner.config.Config.ThresholdModeConfig.Threshold),
+		req.UUID,
+	)
+	if err != nil {
+		return res, err
+	}
+
+	var eg errgroup.Group
+	var sig []byte
+	eg.Go(func() error {
+		var err error
+		sig, err = ccs.signer.Sign(nonces, req.SignBytes)
+		return err
+	})
+	if err := eg.Wait(); err != nil {
+		return res, err
+	}
+
+	res.Signature = sig
+	return res, nil
+}
+
 func (cosigner *LocalCosigner) generateNonces() ([]Nonces, error) {
 	total := len(cosigner.config.Config.ThresholdModeConfig.Cosigners)
 	meta := make([]Nonces, total)
@@ -546,11 +591,17 @@ func (cosigner *LocalCosigner) SetNoncesAndSign(
 		UUID:      req.Nonces.UUID,
 		ChainID:   chainID,
 		SignBytes: req.SignBytes,
+		IsDigest:  req.IsDigest,
 	}
 
 	if len(req.VoteExtensionSignBytes) > 0 {
 		cosignerReq.VoteExtensionSignBytes = req.VoteExtensionSignBytes
 		cosignerReq.VoteExtUUID = req.VoteExtensionNonces.UUID
+	}
+
+	if req.IsDigest {
+		res, err := cosigner.signDigest(cosignerReq)
+		return &res, err
 	}
 
 	res, err := cosigner.sign(cosignerReq)

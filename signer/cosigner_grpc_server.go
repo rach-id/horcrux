@@ -44,10 +44,26 @@ func (rpc *CosignerGRPCServer) SignBlock(
 	}, nil
 }
 
+func (rpc *CosignerGRPCServer) SignDigest(
+	ctx context.Context,
+	req *proto.SignDigestRequest,
+) (*proto.SignedDigestResponse, error) {
+	sig, err := rpc.thresholdValidator.SignDigest(ctx, req.ChainId, req.UniqueId, req.Digest)
+	if err != nil {
+		return nil, err
+	}
+	return &proto.SignedDigestResponse{
+		Signature: sig,
+	}, nil
+}
+
 func (rpc *CosignerGRPCServer) SetNoncesAndSign(
 	ctx context.Context,
 	req *proto.SetNoncesAndSignRequest,
 ) (*proto.SetNoncesAndSignResponse, error) {
+	if req.IsDigest {
+		return rpc.setNoncesAndSignDigest(ctx, req)
+	}
 	cosignerReq := CosignerSetNoncesAndSignRequest{
 		ChainID: req.ChainID,
 
@@ -93,6 +109,42 @@ func (rpc *CosignerGRPCServer) SetNoncesAndSign(
 		Signature:          res.Signature,
 		VoteExtNoncePublic: res.VoteExtensionNoncePublic,
 		VoteExtSignature:   res.VoteExtensionSignature,
+	}, nil
+}
+
+func (rpc *CosignerGRPCServer) setNoncesAndSignDigest(
+	ctx context.Context,
+	req *proto.SetNoncesAndSignRequest,
+) (*proto.SetNoncesAndSignResponse, error) {
+	if !req.IsDigest {
+		return nil, fmt.Errorf("expected is_digest to be true")
+	}
+	cosignerReq := CosignerSetNoncesAndSignRequest{
+		ChainID: req.ChainID,
+		Nonces: &CosignerUUIDNonces{
+			UUID:   uuid.UUID(req.Uuid),
+			Nonces: CosignerNoncesFromProto(req.Nonces),
+		},
+		SignBytes: req.SignBytes,
+		IsDigest:  req.IsDigest,
+	}
+
+	res, err := rpc.cosigner.SetNoncesAndSign(ctx, cosignerReq)
+	if err != nil {
+		rpc.raftStore.logger.Error(
+			"Failed to sign digest with shard",
+			"chain_id", req.ChainID,
+			"error", err,
+		)
+		return nil, err
+	}
+	rpc.raftStore.logger.Info(
+		"Signed digest with shard",
+		"chain_id", req.ChainID,
+	)
+	return &proto.SetNoncesAndSignResponse{
+		NoncePublic: res.NoncePublic,
+		Signature:   res.Signature,
 	}, nil
 }
 

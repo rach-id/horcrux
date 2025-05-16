@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"fmt"
+	"github.com/cometbft/cometbft/crypto"
 	"os"
 	"path/filepath"
 	"testing"
@@ -61,6 +62,9 @@ func testLocalCosignerSignRSA(t *testing.T, threshold, total uint8) {
 	}
 
 	testLocalCosignerSign(t, threshold, total, security)
+	t.Run("sign digest test", func(t *testing.T) {
+		testLocalCosignerDigestSign(t, threshold, total, security)
+	})
 }
 
 func TestLocalCosignerSignECIES2of3(t *testing.T) {
@@ -97,9 +101,127 @@ func testLocalCosignerSignECIES(t *testing.T, threshold, total uint8) {
 	}
 
 	testLocalCosignerSign(t, threshold, total, security)
+	t.Run("sign digest test", func(t *testing.T) {
+		testLocalCosignerDigestSign(t, threshold, total, security)
+	})
 }
 
 func testLocalCosignerSign(t *testing.T, threshold, total uint8, security []CosignerSecurity) {
+	ctx := context.Background()
+	thresholdCosigners, nonces, u, pubKey := setupCosigners(t, ctx, threshold, total, security)
+
+	now := time.Now()
+	hrst := HRSTKey{
+		Height:    1,
+		Round:     0,
+		Step:      2,
+		Timestamp: now.UnixNano(),
+	}
+
+	// pack a vote into sign bytes
+	var vote cometproto.Vote
+	vote.Height = 1
+	vote.Round = 0
+	vote.Type = cometproto.PrevoteType
+	vote.Timestamp = now
+
+	signBytes := comet.VoteSignBytes("chain-id", &vote)
+
+	sigs := make([]PartialSignature, threshold)
+
+	for i, cosigner := range thresholdCosigners {
+		cosignerNonces := make([]CosignerNonce, 0, threshold-1)
+
+		for j, nonce := range nonces {
+			if i == j {
+				continue
+			}
+
+			for _, n := range nonce {
+				if n.DestinationID == cosigner.GetID() {
+					cosignerNonces = append(cosignerNonces, n)
+				}
+			}
+		}
+
+		sigRes, err := cosigner.SetNoncesAndSign(ctx, CosignerSetNoncesAndSignRequest{
+			Nonces: &CosignerUUIDNonces{
+				UUID:   u,
+				Nonces: cosignerNonces,
+			},
+			ChainID:   testChainID,
+			HRST:      hrst,
+			SignBytes: signBytes,
+		})
+		require.NoError(t, err)
+
+		sigs[i] = PartialSignature{
+			ID:        cosigner.GetID(),
+			Signature: sigRes.Signature,
+		}
+	}
+
+	combinedSig, err := thresholdCosigners[0].CombineSignatures(testChainID, sigs)
+	require.NoError(t, err)
+
+	require.True(t, pubKey.VerifySignature(signBytes, combinedSig))
+}
+
+func testLocalCosignerDigestSign(t *testing.T, threshold, total uint8, security []CosignerSecurity) {
+	ctx := context.Background()
+	thresholdCosigners, nonces, u, pubKey := setupCosigners(t, ctx, threshold, total, security)
+	signBytes := comet.DigestSignBytes(testChainID, "uniqueID", []byte("digest"))
+
+	sigs := make([]PartialSignature, threshold)
+	for i, cosigner := range thresholdCosigners {
+		cosignerNonces := make([]CosignerNonce, 0, threshold-1)
+
+		for j, nonce := range nonces {
+			if i == j {
+				continue
+			}
+
+			for _, n := range nonce {
+				if n.DestinationID == cosigner.GetID() {
+					cosignerNonces = append(cosignerNonces, n)
+				}
+			}
+		}
+
+		sigRes, err := cosigner.SetNoncesAndSign(ctx, CosignerSetNoncesAndSignRequest{
+			Nonces: &CosignerUUIDNonces{
+				UUID:   u,
+				Nonces: cosignerNonces,
+			},
+			ChainID:   testChainID,
+			SignBytes: signBytes,
+			IsDigest:  true,
+		})
+		require.NoError(t, err)
+
+		sigs[i] = PartialSignature{
+			ID:        cosigner.GetID(),
+			Signature: sigRes.Signature,
+		}
+	}
+
+	combinedSig, err := thresholdCosigners[0].CombineSignatures(testChainID, sigs)
+	require.NoError(t, err)
+
+	require.True(t, pubKey.VerifySignature(signBytes, combinedSig))
+}
+
+func setupCosigners(
+	t *testing.T,
+	ctx context.Context,
+	threshold, total uint8,
+	security []CosignerSecurity,
+) (
+	[]*LocalCosigner,
+	[][]CosignerNonce,
+	uuid.UUID,
+	crypto.PubKey,
+) {
 	privateKey := cometcryptoed25519.GenPrivKey()
 
 	privKeyBytes := [64]byte{}
@@ -114,21 +236,10 @@ func testLocalCosignerSign(t *testing.T, threshold, total uint8, security []Cosi
 		},
 	}
 
-	ctx := context.Background()
-
 	tmpDir := t.TempDir()
 
 	thresholdCosigners := make([]*LocalCosigner, threshold)
 	nonces := make([][]CosignerNonce, threshold)
-
-	now := time.Now()
-
-	hrst := HRSTKey{
-		Height:    1,
-		Round:     0,
-		Step:      2,
-		Timestamp: now.UnixNano(),
-	}
 
 	u, err := uuid.NewRandom()
 	require.NoError(t, err)
@@ -183,51 +294,5 @@ func testLocalCosignerSign(t *testing.T, threshold, total uint8, security []Cosi
 		}
 	}
 
-	// pack a vote into sign bytes
-	var vote cometproto.Vote
-	vote.Height = 1
-	vote.Round = 0
-	vote.Type = cometproto.PrevoteType
-	vote.Timestamp = now
-
-	signBytes := comet.VoteSignBytes("chain-id", &vote)
-
-	sigs := make([]PartialSignature, threshold)
-
-	for i, cosigner := range thresholdCosigners {
-		cosignerNonces := make([]CosignerNonce, 0, threshold-1)
-
-		for j, nonce := range nonces {
-			if i == j {
-				continue
-			}
-
-			for _, n := range nonce {
-				if n.DestinationID == cosigner.GetID() {
-					cosignerNonces = append(cosignerNonces, n)
-				}
-			}
-		}
-
-		sigRes, err := cosigner.SetNoncesAndSign(ctx, CosignerSetNoncesAndSignRequest{
-			Nonces: &CosignerUUIDNonces{
-				UUID:   u,
-				Nonces: cosignerNonces,
-			},
-			ChainID:   testChainID,
-			HRST:      hrst,
-			SignBytes: signBytes,
-		})
-		require.NoError(t, err)
-
-		sigs[i] = PartialSignature{
-			ID:        cosigner.GetID(),
-			Signature: sigRes.Signature,
-		}
-	}
-
-	combinedSig, err := thresholdCosigners[0].CombineSignatures(testChainID, sigs)
-	require.NoError(t, err)
-
-	require.True(t, pubKey.VerifySignature(signBytes, combinedSig))
+	return thresholdCosigners, nonces, u, pubKey
 }

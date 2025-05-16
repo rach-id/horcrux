@@ -108,18 +108,29 @@ func (cosigner *RemoteCosigner) GetNonces(
 func (cosigner *RemoteCosigner) SetNoncesAndSign(
 	ctx context.Context,
 	req CosignerSetNoncesAndSignRequest) (*CosignerSignResponse, error) {
-	cosignerReq := &proto.SetNoncesAndSignRequest{
-		Uuid:      req.Nonces.UUID[:],
-		ChainID:   req.ChainID,
-		Nonces:    req.Nonces.Nonces.toProto(),
-		Hrst:      req.HRST.toProto(),
-		SignBytes: req.SignBytes,
-	}
+	var cosignerReq *proto.SetNoncesAndSignRequest
+	if req.IsDigest {
+		cosignerReq = &proto.SetNoncesAndSignRequest{
+			Uuid:      req.Nonces.UUID[:],
+			ChainID:   req.ChainID,
+			Nonces:    req.Nonces.Nonces.toProto(),
+			SignBytes: req.SignBytes,
+			IsDigest:  req.IsDigest,
+		}
+	} else {
+		cosignerReq = &proto.SetNoncesAndSignRequest{
+			Uuid:      req.Nonces.UUID[:],
+			ChainID:   req.ChainID,
+			Nonces:    req.Nonces.Nonces.toProto(),
+			Hrst:      req.HRST.toProto(),
+			SignBytes: req.SignBytes,
+		}
 
-	if req.VoteExtensionNonces != nil && len(req.VoteExtensionSignBytes) > 0 {
-		cosignerReq.VoteExtUuid = req.VoteExtensionNonces.UUID[:]
-		cosignerReq.VoteExtNonces = req.VoteExtensionNonces.Nonces.toProto()
-		cosignerReq.VoteExtSignBytes = req.VoteExtensionSignBytes
+		if req.VoteExtensionNonces != nil && len(req.VoteExtensionSignBytes) > 0 {
+			cosignerReq.VoteExtUuid = req.VoteExtensionNonces.UUID[:]
+			cosignerReq.VoteExtNonces = req.VoteExtensionNonces.Nonces.toProto()
+			cosignerReq.VoteExtSignBytes = req.VoteExtensionSignBytes
+		}
 	}
 
 	res, err := cosigner.client.SetNoncesAndSign(ctx, cosignerReq)
@@ -149,5 +160,22 @@ func (cosigner *RemoteCosigner) Sign(
 	return &CosignerSignBlockResponse{
 		Signature:              res.Signature,
 		VoteExtensionSignature: res.VoteExtSignature,
+	}, nil
+}
+
+func (cosigner *RemoteCosigner) SignDigest(
+	ctx context.Context,
+	req CosignerSignDigestRequest,
+) (*CosignerSignDigestResponse, error) {
+	res, err := cosigner.client.SignDigest(ctx, &proto.SignDigestRequest{
+		ChainId:  req.ChainID,
+		UniqueId: req.UniqueID,
+		Digest:   req.Digest,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &CosignerSignDigestResponse{
+		Signature: res.Signature,
 	}, nil
 }

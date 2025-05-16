@@ -3,6 +3,7 @@ package signer
 import (
 	"context"
 	"fmt"
+	"github.com/cometbft/cometbft/libs/bytes"
 	"net"
 	"time"
 
@@ -103,6 +104,20 @@ func (s *RemoteSignerGRPCServer) Sign(
 	}, nil
 }
 
+func (s *RemoteSignerGRPCServer) SignDigest(
+	ctx context.Context,
+	req *proto.SignDigestRequest,
+) (*proto.SignedDigestResponse, error) {
+	sig, err := signDigest(s.logger, s.validator, req.ChainId, req.UniqueId, req.Digest)
+	if err != nil {
+		return nil, err
+	}
+
+	return &proto.SignedDigestResponse{
+		Signature: sig,
+	}, nil
+}
+
 func signAndTrack(
 	ctx context.Context,
 	logger cometlog.Logger,
@@ -197,4 +212,27 @@ func signAndTrack(
 	}
 
 	return sig, voteExtSig, timestamp, nil
+}
+
+func signDigest(
+	logger cometlog.Logger,
+	validator PrivValidator,
+	uniqueID string,
+	chainID string,
+	digest bytes.HexBytes,
+) ([]byte, error) {
+	sig, err := validator.SignDigest(context.Background(), chainID, uniqueID, digest)
+	if err != nil {
+		return nil, err
+	}
+
+	logger.Info(
+		"Signed",
+		"type", "digest",
+		"chain_id", chainID,
+		"unique_id", uniqueID,
+		"digest", digest,
+	)
+
+	return sig, nil
 }

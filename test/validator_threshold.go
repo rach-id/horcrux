@@ -4,6 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/cometbft/cometbft/types"
+	"github.com/strangelove-ventures/horcrux/v3/signer/proto"
+	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc"
 	"net/http"
 	"testing"
 	"time"
@@ -35,6 +39,11 @@ func testChainSingleNodeAndHorcruxThreshold(
 ) {
 	ctx := context.Background()
 	cw, pubKey := startChainSingleNodeAndHorcruxThreshold(ctx, t, totalValidators, totalSigners, threshold, totalSentries, sentriesPerSigner)
+
+	// manually test signing digests
+	t.Run("test signing digests", func(t *testing.T) {
+		testDigestSigning(t, ctx, cw, pubKey)
+	})
 
 	ourValidator := cw.chain.Validators[0]
 	cosigners := ourValidator.Sidecars
@@ -415,4 +424,31 @@ func getMetrics(ctx context.Context, cosigner *cosmos.SidecarProcess) (map[strin
 	}
 
 	return mf, nil
+}
+
+func testDigestSigning(t *testing.T, ctx context.Context, cw *chainWrapper, key crypto.PubKey) {
+	ourValidator := cw.chain.Validators[0]
+	cosigners := ourValidator.Sidecars
+	signerRemoteAddr, err := cosigners[0].GetHostPorts(ctx, signerPortDocker)
+	require.NoError(t, err)
+	require.NotEmpty(t, signerRemoteAddr)
+
+	uniqueID := "test-id"
+	digest := []byte("test-digest")
+	chainID := cw.chain.Config().ChainID
+	signBytes := types.DigestSignBytes(chainID, uniqueID, digest)
+
+	grpcConn, err := grpc.NewClient(signerRemoteAddr[0], grpc.WithInsecure())
+	require.NoError(t, err)
+	defer grpcConn.Close()
+	cosignerClient := proto.NewCosignerClient(grpcConn)
+
+	signature, err := cosignerClient.SignDigest(ctx, &proto.SignDigestRequest{
+		Digest:   digest,
+		ChainId:  chainID,
+		UniqueId: uniqueID,
+	})
+	require.NoError(t, err)
+
+	assert.True(t, key.VerifySignature(signBytes, signature.Signature))
 }

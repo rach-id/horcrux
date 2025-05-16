@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/cometbft/cometbft/libs/bytes"
 	"time"
 
 	cometcrypto "github.com/cometbft/cometbft/crypto"
@@ -54,6 +55,7 @@ type CosignerSignRequest struct {
 	UUID                   uuid.UUID
 	VoteExtensionSignBytes []byte
 	VoteExtUUID            uuid.UUID
+	IsDigest               bool
 }
 
 type CosignerSignResponse struct {
@@ -118,6 +120,17 @@ type CosignerSignBlockResponse struct {
 	Signature              []byte
 	VoteExtensionSignature []byte
 }
+
+type CosignerSignDigestRequest struct {
+	ChainID  string
+	UniqueID string
+	Digest   bytes.HexBytes
+}
+
+type CosignerSignDigestResponse struct {
+	Signature []byte
+}
+
 type CosignerUUIDNonces struct {
 	UUID   uuid.UUID
 	Nonces CosignerNonces
@@ -155,6 +168,8 @@ type CosignerSetNoncesAndSignRequest struct {
 
 	VoteExtensionNonces    *CosignerUUIDNonces
 	VoteExtensionSignBytes []byte
+
+	IsDigest bool
 }
 
 func verifySignPayload(chainID string, signBytes, voteExtensionSignBytes []byte) (HRSTKey, bool, error) {
