@@ -216,8 +216,8 @@ func signAndTrack(
 func signRawBytes(
 	logger cometlog.Logger,
 	validator PrivValidator,
-	uniqueID string,
 	chainID string,
+	uniqueID string,
 	rawBytes []byte,
 ) ([]byte, error) {
 	sig, err := validator.SignRawBytes(context.Background(), chainID, uniqueID, rawBytes)
