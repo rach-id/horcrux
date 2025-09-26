@@ -4,10 +4,8 @@ on:
   push:
     branches:
       - '**'
-    tags-ignore:
-      - "v[0-9]+.[0-9]+.[0-9]+" # Push events to matching v*, i.e. v1.0, v20.15.10
-      - "v[0-9]+.[0-9]+.[0-9]+-beta[0-9]+"
-      - "v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+"
+    tags:
+      - '*'
 
 env:
   REGISTRY: ghcr.io
